@@ -1,0 +1,187 @@
+flowmind/
+├── README.md
+├── requirements.txt
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+├── docs/
+│   ├── architecture.md
+│   ├── api-documentation.md
+│   └── deployment-guide.md
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── workflow.py
+│   │   │   ├── process.py
+│   │   │   ├── optimization.py
+│   │   │   └── analytics.py
+│   │   ├── schemas/
+│   │   │   ├── __init__.py
+│   │   │   ├── workflow.py
+│   │   │   ├── process.py
+│   │   │   └── optimization.py
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   ├── v1/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── workflow.py
+│   │   │   │   ├── process.py
+│   │   │   │   ├── optimization.py
+│   │   │   │   └── analytics.py
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── workflow_service.py
+│   │   │   ├── process_mining_service.py
+│   │   │   ├── optimization_service.py
+│   │   │   ├── prediction_service.py
+│   │   │   └── agent_coordination_service.py
+│   │   ├── ai/
+│   │   │   ├── __init__.py
+│   │   │   ├── models/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── process_predictor.py
+│   │   │   │   ├── bottleneck_detector.py
+│   │   │   │   ├── optimization_agent.py
+│   │   │   │   └── workflow_classifier.py
+│   │   │   ├── processors/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── event_processor.py
+│   │   │   │   ├── pattern_extractor.py
+│   │   │   │   └── anomaly_detector.py
+│   │   │   └── agents/
+│   │   │       ├── __init__.py
+│   │   │       ├── coordination_agent.py
+│   │   │       ├── optimization_agent.py
+│   │   │       └── monitoring_agent.py
+│   │   ├── utils/
+│   │   │   ├── __init__.py
+│   │   │   ├── logging.py
+│   │   │   ├── metrics.py
+│   │   │   └── validators.py
+│   │   └── tests/
+│   │       ├── __init__.py
+│   │       ├── test_workflow.py
+│   │       ├── test_process_mining.py
+│   │       └── test_optimization.py
+│   ├── celery_worker.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── public/
+│   │   ├── index.html
+│   │   └── favicon.ico
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── Dashboard/
+│   │   │   │   ├── Dashboard.jsx
+│   │   │   │   ├── Dashboard.css
+│   │   │   │   ├── WorkflowOverview.jsx
+│   │   │   │   ├── PerformanceMetrics.jsx
+│   │   │   │   └── OptimizationSuggestions.jsx
+│   │   │   ├── Workflow/
+│   │   │   │   ├── WorkflowDesigner.jsx
+│   │   │   │   ├── WorkflowVisualizer.jsx
+│   │   │   │   ├── ProcessMap.jsx
+│   │   │   │   └── FlowEditor.jsx
+│   │   │   ├── Analytics/
+│   │   │   │   ├── AnalyticsDashboard.jsx
+│   │   │   │   ├── PerformanceCharts.jsx
+│   │   │   │   ├── BottleneckAnalysis.jsx
+│   │   │   │   └── PredictiveInsights.jsx
+│   │   │   └── Common/
+│   │   │       ├── Header.jsx
+│   │   │       ├── Sidebar.jsx
+│   │   │       ├── Loading.jsx
+│   │   │       └── ErrorBoundary.jsx
+│   │   ├── services/
+│   │   │   ├── api.js
+│   │   │   ├── workflow.js
+│   │   │   ├── analytics.js
+│   │   │   └── websocket.js
+│   │   ├── store/
+│   │   │   ├── index.js
+│   │   │   ├── workflowSlice.js
+│   │   │   ├── analyticsSlice.js
+│   │   │   └── optimizationSlice.js
+│   │   ├── utils/
+│   │   │   ├── constants.js
+│   │   │   ├── helpers.js
+│   │   │   └── formatters.js
+│   │   ├── App.jsx
+│   │   ├── App.css
+│   │   └── index.js
+│   ├── Dockerfile
+│   └── nginx.conf
+├── ml-pipeline/
+│   ├── __init__.py
+│   ├── data/
+│   │   ├── raw/
+│   │   ├── processed/
+│   │   └── models/
+│   ├── notebooks/
+│   │   ├── data_exploration.ipynb
+│   │   ├── model_training.ipynb
+│   │   └── performance_analysis.ipynb
+│   ├── scripts/
+│   │   ├── train_models.py
+│   │   ├── evaluate_models.py
+│   │   └── deploy_models.py
+│   ├── src/
+│   │   ├── data/
+│   │   │   ├── __init__.py
+│   │   │   ├── data_loader.py
+│   │   │   ├── preprocessor.py
+│   │   │   └── feature_engineer.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── base_model.py
+│   │   │   ├── process_predictor.py
+│   │   │   ├── bottleneck_detector.py
+│   │   │   └── optimization_engine.py
+│   │   └── utils/
+│   │       ├── __init__.py
+│   │       ├── metrics.py
+│   │       └── visualization.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── data-pipeline/
+│   ├── kafka/
+│   │   ├── docker-compose.yml
+│   │   └── config/
+│   ├── processors/
+│   │   ├── __init__.py
+│   │   ├── event_processor.py
+│   │   ├── stream_processor.py
+│   │   └── batch_processor.py
+│   └── schemas/
+│       ├── workflow_events.avro
+│       └── process_events.avro
+├── infrastructure/
+│   ├── docker/
+│   │   ├── docker-compose.yml
+│   │   ├── docker-compose.prod.yml
+│   │   └── docker-compose.dev.yml
+│   ├── kubernetes/
+│   │   ├── namespace.yaml
+│   │   ├── backend-deployment.yaml
+│   │   ├── frontend-deployment.yaml
+│   │   ├── database-deployment.yaml
+│   │   └── ingress.yaml
+│   └── terraform/
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+└── monitoring/
+    ├── prometheus/
+    │   └── prometheus.yml
+    ├── grafana/
+    │   └── dashboards/
+    └── alerts/
+        └── alert-rules.yml
