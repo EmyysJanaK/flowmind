@@ -63,6 +63,25 @@ from .incident_store import (
     store_resolved_incident,
     find_similar_past_incidents,
 )
+from .rag_retriever import (
+    # Core retriever
+    RAGRetriever,
+    # Data classes
+    IncidentContext,
+    RetrievalResult,
+    RetrievedDocument,
+    RankingExplanation,
+    # Enums
+    ContentType,
+    RankingFactor,
+    # Ranking engine
+    RankingEngine,
+    # Singleton accessor
+    get_rag_retriever,
+    # Convenience functions
+    retrieve_for_incident,
+    get_grounding_context,
+)
 
 __all__ = [
     # Memory Store
@@ -104,4 +123,16 @@ __all__ = [
     "store_incident",
     "store_resolved_incident",
     "find_similar_past_incidents",
+    # RAG Retriever
+    "RAGRetriever",
+    "IncidentContext",
+    "RetrievalResult",
+    "RetrievedDocument",
+    "RankingExplanation",
+    "ContentType",
+    "RankingFactor",
+    "RankingEngine",
+    "get_rag_retriever",
+    "retrieve_for_incident",
+    "get_grounding_context",
 ]
