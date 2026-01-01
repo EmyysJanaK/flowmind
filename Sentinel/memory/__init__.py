@@ -29,6 +29,21 @@ from .vector_store import (
     generate_document_id,
     bulk_import_documents,
 )
+from .runbook_loader import (
+    # Core loader
+    RunbookLoader,
+    LoadResult,
+    # Data classes
+    RunbookMetadata,
+    RunbookChunk,
+    # Parsers
+    MarkdownParser,
+    PlainTextParser,
+    TextChunker,
+    # Convenience functions
+    load_runbooks,
+    create_runbook,
+)
 
 __all__ = [
     # Memory Store
@@ -48,4 +63,14 @@ __all__ = [
     # Utilities
     "generate_document_id",
     "bulk_import_documents",
+    # Runbook Loader
+    "RunbookLoader",
+    "LoadResult",
+    "RunbookMetadata",
+    "RunbookChunk",
+    "MarkdownParser",
+    "PlainTextParser",
+    "TextChunker",
+    "load_runbooks",
+    "create_runbook",
 ]

@@ -16,3 +16,9 @@ chromadb>=0.4.0
 # Provides local embedding models. Default: all-MiniLM-L6-v2
 # Runs entirely locally - no API key required.
 sentence-transformers>=2.2.0
+
+# YAML Parser (Frontmatter)
+# -------------------------
+# Used for parsing YAML frontmatter in markdown runbooks.
+# Enables structured metadata extraction (service, severity, etc.)
+pyyaml>=6.0
