@@ -7,8 +7,9 @@ and vector-based semantic search for knowledge retrieval.
 Components:
 - MemoryStore: Conversation history and shared state
 - VectorStore: ChromaDB-based semantic search
-- IncidentVectorStore: Past incidents for similarity matching
+- IncidentStore: Past incidents with resolutions for similarity matching
 - RunbookVectorStore: Documentation and runbooks search
+- RunbookLoader: Ingestion of markdown/text runbooks
 """
 
 from .store import MemoryStore
@@ -23,7 +24,7 @@ from .vector_store import (
     RunbookVectorStore,
     # Singleton accessors
     get_vector_store,
-    get_incident_store,
+    get_incident_store as get_incident_vector_store,  # Legacy alias
     get_runbook_store,
     # Utilities
     generate_document_id,
@@ -44,6 +45,24 @@ from .runbook_loader import (
     load_runbooks,
     create_runbook,
 )
+from .incident_store import (
+    # Core store
+    IncidentStore,
+    # Data classes
+    IncidentRecord,
+    IncidentTimeline,
+    ResolutionStep,
+    IncidentSearchResult,
+    # Enums
+    Severity,
+    IncidentStatus,
+    # Singleton accessor
+    get_incident_store,
+    # Convenience functions
+    store_incident,
+    store_resolved_incident,
+    find_similar_past_incidents,
+)
 
 __all__ = [
     # Memory Store
@@ -53,12 +72,13 @@ __all__ = [
     "VectorStoreConfig",
     "Document",
     "SearchResult",
-    # Specialized stores
+    # Specialized stores (legacy)
     "IncidentVectorStore",
     "RunbookVectorStore",
     # Singleton accessors
     "get_vector_store",
     "get_incident_store",
+    "get_incident_vector_store",
     "get_runbook_store",
     # Utilities
     "generate_document_id",
@@ -73,4 +93,15 @@ __all__ = [
     "TextChunker",
     "load_runbooks",
     "create_runbook",
+    # Incident Store
+    "IncidentStore",
+    "IncidentRecord",
+    "IncidentTimeline",
+    "ResolutionStep",
+    "IncidentSearchResult",
+    "Severity",
+    "IncidentStatus",
+    "store_incident",
+    "store_resolved_incident",
+    "find_similar_past_incidents",
 ]
