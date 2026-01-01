@@ -78,6 +78,7 @@ Example:
 from typing import Any, Dict, List, Callable, Optional
 from enum import Enum
 import inspect
+import time
 from .docker_tools import (
     fetch_container_logs,
     restart_container
@@ -86,6 +87,8 @@ from .k8s_tools import (
     get_pod_status,
     restart_pod
 )
+from .validation import get_validator, ValidationError
+from .audit_logger import get_audit_logger, AuditAction, AuditLevel
 
 
 class ToolCategory(Enum):
@@ -287,38 +290,227 @@ class ToolRegistry:
     async def call_tool(
         self,
         tool_name: str,
+        agent_name: Optional[str] = None,
+        llm_model: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Call a registered tool with validation.
+        Call a registered tool with validation, authorization, and logging.
 
-        SAFETY: Validates that tool is registered before executing.
-        This prevents agents from calling arbitrary functions.
+        SAFETY ARCHITECTURE: 3-PHASE VALIDATION
+        ========================================
+
+        PHASE 1: TOOL DISCOVERY
+        - Verify tool is registered
+        - Log tool invocation request
+
+        PHASE 2: PARAMETER VALIDATION
+        - Validate all parameters against safety rules
+        - Block dangerous patterns (wildcards, injection, etc.)
+        - Enforce resource limits
+        - Log validation result
+
+        PHASE 3: EXECUTION & LOGGING
+        - Execute tool function
+        - Log success/failure
+        - Record execution time
+        - Analyze suspicious patterns
+
+        This prevents LLM misuse by:
+        - Blocking invalid parameters before execution
+        - Logging all attempts (including blocked ones)
+        - Enabling threat detection on audit logs
+        - Providing forensic evidence
 
         Args:
             tool_name: Name of registered tool
+            agent_name: Optional name of agent calling tool
+            llm_model: Optional LLM model name (e.g., "gpt-4")
             **kwargs: Arguments to pass to tool
 
         Returns:
-            Result from tool execution
+            Result from tool execution with validation/auth results
 
         Raises:
-            ValueError: If tool not found or execution fails
+            ValueError: If tool not found or validation fails
         """
+        validator = get_validator()
+        audit_logger = get_audit_logger()
+        start_time = time.time()
+
+        # ================================================================
+        # PHASE 1: TOOL DISCOVERY & LOGGING
+        # ================================================================
+
         tool = self.get_tool(tool_name)
         if not tool:
+            # Log tool not found
+            audit_logger.log(
+                action=AuditAction.TOOL_CALL_REQUESTED,
+                level=AuditLevel.WARNING,
+                tool_name=tool_name,
+                agent_name=agent_name,
+                llm_model=llm_model,
+                parameters=kwargs,
+                error="Tool not registered",
+                error_type="tool_not_found"
+            )
             raise ValueError(f"Tool '{tool_name}' not found in registry")
 
+        # Log tool request
+        audit_logger.log(
+            action=AuditAction.TOOL_CALL_REQUESTED,
+            level=AuditLevel.INFO,
+            tool_name=tool_name,
+            agent_name=agent_name,
+            llm_model=llm_model,
+            parameters=kwargs
+        )
+
+        # ================================================================
+        # PHASE 2: PARAMETER VALIDATION
+        # ================================================================
+
+        audit_logger.log(
+            action=AuditAction.VALIDATION_STARTED,
+            level=AuditLevel.DEBUG,
+            tool_name=tool_name,
+            agent_name=agent_name,
+            llm_model=llm_model
+        )
+
         try:
-            # Call the async function
-            result = await tool.async_func(**kwargs)
-            return result
+            validation_result = validator.validate(tool_name, kwargs)
         except Exception as e:
+            # Validation threw an exception - log and fail
+            audit_logger.log(
+                action=AuditAction.VALIDATION_FAILED,
+                level=AuditLevel.CRITICAL,
+                tool_name=tool_name,
+                agent_name=agent_name,
+                llm_model=llm_model,
+                parameters=kwargs,
+                validation_result={"error": str(e)},
+                error=str(e),
+                error_type="validation_exception"
+            )
+            return {
+                "success": False,
+                "error": f"Validation failed: {str(e)}",
+                "error_type": "validation_failed",
+                "tool_name": tool_name,
+                "blocked": True
+            }
+
+        # Check validation results
+        if not validation_result["valid"]:
+            # Validation failed - log and block execution
+            audit_logger.log(
+                action=AuditAction.VALIDATION_FAILED,
+                level=AuditLevel.CRITICAL,
+                tool_name=tool_name,
+                agent_name=agent_name,
+                llm_model=llm_model,
+                parameters=kwargs,
+                validation_result=validation_result,
+                error="; ".join(validation_result["errors"]),
+                error_type="validation_failed",
+                details=f"Validation errors: {validation_result['errors']}"
+            )
+            return {
+                "success": False,
+                "error": "Validation failed: " + "; ".join(validation_result["errors"]),
+                "error_type": "validation_failed",
+                "tool_name": tool_name,
+                "blocked": True,
+                "validation_errors": validation_result["errors"]
+            }
+
+        # Log validation success
+        audit_logger.log(
+            action=AuditAction.VALIDATION_PASSED,
+            level=AuditLevel.DEBUG,
+            tool_name=tool_name,
+            agent_name=agent_name,
+            llm_model=llm_model,
+            parameters=kwargs
+        )
+
+        # ================================================================
+        # PHASE 3: EXECUTION & LOGGING
+        # ================================================================
+
+        audit_logger.log(
+            action=AuditAction.EXECUTION_STARTED,
+            level=AuditLevel.INFO,
+            tool_name=tool_name,
+            agent_name=agent_name,
+            llm_model=llm_model,
+            parameters=kwargs
+        )
+
+        try:
+            # Execute the tool function
+            result = await tool.async_func(**kwargs)
+
+            # Record execution time
+            duration_ms = (time.time() - start_time) * 1000
+
+            # Log success
+            audit_logger.log(
+                action=AuditAction.EXECUTION_COMPLETED,
+                level=AuditLevel.INFO,
+                tool_name=tool_name,
+                agent_name=agent_name,
+                llm_model=llm_model,
+                parameters=kwargs,
+                execution_result=result,
+                duration_ms=duration_ms
+            )
+
+            return result
+
+        except Exception as e:
+            # Log execution failure
+            duration_ms = (time.time() - start_time) * 1000
+            error_type = type(e).__name__
+
+            audit_logger.log(
+                action=AuditAction.EXECUTION_FAILED,
+                level=AuditLevel.WARNING,
+                tool_name=tool_name,
+                agent_name=agent_name,
+                llm_model=llm_model,
+                parameters=kwargs,
+                duration_ms=duration_ms,
+                error=str(e),
+                error_type=error_type
+            )
+
             return {
                 "success": False,
                 "error": str(e),
-                "error_type": "tool_execution_error"
+                "error_type": "execution_error",
+                "tool_name": tool_name
             }
+
+    def get_security_report(self) -> Dict[str, Any]:
+        """
+        Get security report including validation failures and suspicious patterns.
+
+        Used for security monitoring and threat detection.
+
+        Returns:
+            Dict with security information
+        """
+        audit_logger = get_audit_logger()
+
+        return {
+            "audit_logs_total": len(audit_logger.memory_log),
+            "validation_failures": len(audit_logger.get_failed_validations()),
+            "suspicious_patterns": audit_logger.get_suspicious_patterns(),
+            "audit_report": audit_logger.generate_report()
+        }
 
     def describe_tool(self, tool_name: str) -> str:
         """

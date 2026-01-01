@@ -44,6 +44,20 @@ from .registry import (
     get_registry,
     initialize_registry
 )
+from .validation import (
+    ParameterValidator,
+    ValidationRule,
+    ValidationLevel,
+    ValidationError,
+    get_validator
+)
+from .audit_logger import (
+    AuditLogger,
+    AuditLogEntry,
+    AuditLevel,
+    AuditAction,
+    get_audit_logger
+)
 
 __all__ = [
     "BaseTool",
@@ -59,6 +73,16 @@ __all__ = [
     "ToolRegistration",
     "ToolCategory",
     "get_registry",
-    "initialize_registry"
+    "initialize_registry",
+    "ParameterValidator",
+    "ValidationRule",
+    "ValidationLevel",
+    "ValidationError",
+    "get_validator",
+    "AuditLogger",
+    "AuditLogEntry",
+    "AuditLevel",
+    "AuditAction",
+    "get_audit_logger"
 ]
 
