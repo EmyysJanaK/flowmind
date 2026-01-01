@@ -25,6 +25,9 @@ Usage:
 
 from typing import Any, Dict, Optional, List
 from datetime import datetime
+import re
+import subprocess
+import json
 from .base import BaseTool
 
 
@@ -407,3 +410,534 @@ def get_k8s_tools() -> List[BaseTool]:
         KubernetesScaleTool(),
         KubernetesHealthTool()
     ]
+
+
+async def get_pod_status(
+    namespace: str,
+    pod_name: str,
+    use_real_kubectl: bool = False
+) -> Dict[str, Any]:
+    """
+    Safely retrieve Kubernetes pod status with read-only access.
+
+    READ-ONLY ACCESS DESIGN RATIONALE
+    ===================================
+
+    This tool is READ-ONLY (no write/delete permissions) by design:
+
+    1. SAFETY THROUGH CONSTRAINTS
+       At the current stage of Sentinel development, agents are not
+       trusted with modification capabilities. Read-only access allows:
+       - Safe investigation of cluster state
+       - No risk of accidental deletion or corruption
+       - Testing and validation of agent decision-making
+       - Building trust in agent behavior
+
+    2. SEPARATION OF CONCERNS
+       Read operations (investigation) are separated from write operations
+       (execution). This follows the Sentinel principle:
+       - DetectiveAgent: Investigates using READ tools
+       - ResearcherAgent: Recommends solutions (no cluster access)
+       - OperatorAgent: Plans execution (READ + PLAN, no execution)
+       - ExecutorAgent: Would have WRITE tools for execution (not yet implemented)
+
+    3. INCREMENTAL CAPABILITY ESCALATION
+       As agents prove their reliability:
+       - Phase 1 (Current): Read-only investigation
+       - Phase 2: Write operations with human approval
+       - Phase 3: Write operations with automatic approval (high confidence)
+       - Phase 4: Full autonomous cluster management
+
+    4. AUDIT & RECOVERY
+       Keeping reads separate from writes simplifies:
+       - Audit trail analysis
+       - Understanding what was investigated vs executed
+       - Rolling back just the writes if needed
+       - Forensic analysis of agent decisions
+
+    5. THREAT MITIGATION
+       If agent is compromised or behaves unexpectedly:
+       - Limited to reading cluster state
+       - Cannot delete resources
+       - Cannot modify configurations
+       - Cannot escalate to other clusters
+
+    FUTURE WRITE OPERATIONS
+    When write capabilities are added, they will:
+    - Require explicit agent permissions (RBAC)
+    - Need approval for production operations
+    - Be rate-limited and logged
+    - Support dry-run for safety validation
+    - Track exact changes for rollback
+
+    Args:
+        namespace (str): Kubernetes namespace. Must be alphanumeric with
+            dashes only. Validated to prevent injection.
+            Examples: "default", "production", "kube-system"
+        pod_name (str): Name of the pod to query. Must be alphanumeric
+            with dashes only. Validated to prevent injection.
+            Examples: "web-service-7d9f4c", "db-primary-0"
+        use_real_kubectl (bool): Whether to use real kubectl or mock mode
+            (default: False). In production, set to True with proper
+            kubectl configuration and RBAC.
+
+    Returns:
+        Dict with:
+        - "success" (bool): Query succeeded
+        - "namespace" (str): Kubernetes namespace
+        - "pod_name" (str): Pod name
+        - "status" (Dict): Detailed pod status:
+            - "phase": str (Pending, Running, Succeeded, Failed, Unknown)
+            - "ready": bool - all containers ready?
+            - "conditions": List[Dict] - pod conditions
+            - "containers": List[Dict] - container statuses
+            - "restart_count": int - total restarts
+            - "age": str - how long pod has existed
+            - "cpu_usage": str - current CPU usage
+            - "memory_usage": str - current memory usage
+        - "timestamp": str - ISO timestamp
+        - "error": str - error message if failed
+        - "error_type": str - category of error
+
+    Example:
+        >>> result = await get_pod_status("production", "web-service-7d9f4c")
+        >>> if result["success"]:
+        ...     status = result["status"]
+        ...     print(f"Pod phase: {status['phase']}")
+        ...     print(f"Ready: {status['ready']}")
+        ... else:
+        ...     print(f"Error: {result['error']}")
+    """
+
+    # =========================================================================
+    # PHASE 1: INPUT VALIDATION & SANITIZATION
+    # =========================================================================
+
+    # Validate namespace: Kubernetes namespace naming rules
+    # Must be alphanumeric and dash, max 63 characters
+    namespace_pattern = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    if not namespace:
+        return {
+            "success": False,
+            "error": "Namespace cannot be empty",
+            "error_type": "invalid_input",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    if not re.match(namespace_pattern, namespace):
+        return {
+            "success": False,
+            "namespace": namespace,
+            "error": "Invalid namespace format",
+            "error_type": "invalid_format",
+            "timestamp": datetime.now().isoformat(),
+            "security_reason": "Namespace must be lowercase alphanumeric with dashes"
+        }
+
+    # Validate pod name: Kubernetes pod naming rules
+    # Must be alphanumeric and dash, max 63 characters
+    pod_pattern = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    if not pod_name:
+        return {
+            "success": False,
+            "error": "Pod name cannot be empty",
+            "error_type": "invalid_input",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    if not re.match(pod_pattern, pod_name):
+        return {
+            "success": False,
+            "pod_name": pod_name,
+            "error": "Invalid pod name format",
+            "error_type": "invalid_format",
+            "timestamp": datetime.now().isoformat(),
+            "security_reason": "Pod name must be lowercase alphanumeric with dashes"
+        }
+
+    # =========================================================================
+    # PHASE 2: PERMISSION & AUTHORIZATION CHECK
+    # =========================================================================
+
+    # In production, verify read-only permission
+    # Example:
+    # if not await check_agent_permissions(agent_id, namespace, pod_name, "get_status"):
+    #     return {
+    #         "success": False,
+    #         "error": "Permission denied",
+    #         "error_type": "unauthorized",
+    #         "timestamp": datetime.now().isoformat()
+    #     }
+
+    # =========================================================================
+    # PHASE 3: EXECUTE KUBECTL QUERY
+    # =========================================================================
+
+    if use_real_kubectl:
+        return await _get_pod_status_real(namespace, pod_name)
+    else:
+        return await _get_pod_status_mock(namespace, pod_name)
+
+
+async def _get_pod_status_real(
+    namespace: str,
+    pod_name: str
+) -> Dict[str, Any]:
+    """
+    Execute real kubectl pod status query.
+
+    SECURITY: Uses subprocess with shell=False and argument list to prevent
+    command injection. Arguments are passed separately, no shell interpolation.
+    Only supports READ operations (--output json for queries).
+
+    Args:
+        namespace: Validated Kubernetes namespace
+        pod_name: Validated pod name
+
+    Returns:
+        Dict with pod status or error information
+    """
+
+    try:
+        # SECURITY: subprocess with shell=False + argument list prevents injection
+        # Command structure: kubectl get pod <pod_name> -n <namespace> -o json
+        command = [
+            "kubectl",                                  # kubectl executable
+            "get",                                      # Subcommand (read-only)
+            "pod",                                      # Resource type
+            pod_name,                                   # Validated pod name
+            "-n", namespace,                            # Validated namespace (argument style)
+            "-o", "json"                                # Output format (safe, structured)
+        ]
+
+        # Execute with timeout to prevent hanging
+        result = subprocess.run(
+            command,
+            capture_output=True,                        # Capture output
+            text=True,                                  # Return strings
+            timeout=30,                                 # 30 second timeout
+            check=False                                 # Don't raise on non-zero exit
+        )
+
+        # =========================================================================
+        # PHASE 4: PARSE & STRUCTURE RESULTS
+        # =========================================================================
+
+        if result.returncode != 0:
+            # kubectl command failed - parse error
+            error_type, error_msg = _analyze_kubectl_error(result.stderr)
+
+            return {
+                "success": False,
+                "namespace": namespace,
+                "pod_name": pod_name,
+                "error": error_msg,
+                "error_type": error_type,
+                "timestamp": datetime.now().isoformat()
+            }
+
+        # Parse JSON output
+        try:
+            pod_data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {
+                "success": False,
+                "namespace": namespace,
+                "pod_name": pod_name,
+                "error": "Failed to parse kubectl output",
+                "error_type": "parse_error",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        # Extract status information
+        status_dict = _extract_pod_status(pod_data)
+
+        return {
+            "success": True,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "status": status_dict,
+            "timestamp": datetime.now().isoformat(),
+            "raw_data": pod_data  # Include full data for debugging
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "error": "kubectl query timed out",
+            "error_type": "timeout",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "error": "kubectl executable not found",
+            "error_type": "kubectl_not_available",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "error": "Failed to get pod status due to system error",
+            "error_type": "system_error",
+            "timestamp": datetime.now().isoformat()
+            # Internal logging: logger.error(f"kubectl get failed: {e}", exc_info=True)
+        }
+
+
+async def _get_pod_status_mock(
+    namespace: str,
+    pod_name: str
+) -> Dict[str, Any]:
+    """
+    Mock Kubernetes pod status query for testing without real cluster.
+
+    Args:
+        namespace: Namespace name
+        pod_name: Pod name
+
+    Returns:
+        Mock pod status data
+    """
+
+    status_dict = {
+        "phase": "Running",
+        "ready": True,
+        "ready_containers": 1,
+        "total_containers": 1,
+        "restart_count": 0,
+        "age": "5 days",
+        "conditions": [
+            {
+                "type": "Initialized",
+                "status": "True",
+                "reason": "PodInitialized"
+            },
+            {
+                "type": "Ready",
+                "status": "True",
+                "reason": "ContainersReady"
+            },
+            {
+                "type": "ContainersReady",
+                "status": "True",
+                "reason": "ContainersReady"
+            },
+            {
+                "type": "PodScheduled",
+                "status": "True",
+                "reason": "Successfully assigned"
+            }
+        ],
+        "containers": [
+            {
+                "name": "web-service",
+                "image": "web-service:v1.2.3",
+                "status": "Running",
+                "ready": True,
+                "restarts": 0
+            }
+        ],
+        "node": "worker-node-2",
+        "cpu_usage": "125m",
+        "memory_usage": "256Mi"
+    }
+
+    return {
+        "success": True,
+        "namespace": namespace,
+        "pod_name": pod_name,
+        "status": status_dict,
+        "timestamp": datetime.now().isoformat(),
+        "note": "Mock status - real Kubernetes not connected"
+    }
+
+
+def _analyze_kubectl_error(error_output: str) -> tuple[str, str]:
+    """
+    Analyze kubectl error and categorize it safely.
+
+    Maps kubectl errors to error types:
+    - not_found: Pod or namespace doesn't exist
+    - connection_error: Cannot connect to cluster
+    - permission_error: Insufficient permissions
+    - configuration_error: kubectl config issue
+    - unknown: Unclassified error
+
+    Args:
+        error_output: Raw kubectl error message
+
+    Returns:
+        Tuple of (error_type: str, error_message: str)
+    """
+
+    error_lower = error_output.lower()
+
+    # Detect specific error types
+    if "not found" in error_lower or "does not exist" in error_lower:
+        if "namespace" in error_lower:
+            return ("not_found", "Namespace not found")
+        else:
+            return ("not_found", "Pod not found in namespace")
+
+    if "connection refused" in error_lower or "unable to connect" in error_lower:
+        return (
+            "connection_error",
+            "Cannot connect to Kubernetes cluster - API server may be down"
+        )
+
+    if "permission denied" in error_lower or "forbidden" in error_lower:
+        return (
+            "permission_error",
+            "Permission denied - check RBAC permissions"
+        )
+
+    if "config" in error_lower or "kubeconfig" in error_lower:
+        return (
+            "configuration_error",
+            "kubectl configuration issue - check kubeconfig"
+        )
+
+    # Generic error with sanitization
+    sanitized = _sanitize_kubectl_error(error_output)
+    return ("unknown_error", f"kubectl error: {sanitized}")
+
+
+def _sanitize_kubectl_error(error_msg: str) -> str:
+    """
+    Sanitize kubectl error messages to remove sensitive information.
+
+    Removes:
+    - File system paths
+    - IP addresses and hostnames
+    - API server URLs
+    - Token references
+
+    Args:
+        error_msg: Raw kubectl error message
+
+    Returns:
+        Sanitized error message
+    """
+
+    # Remove file paths
+    error_msg = re.sub(r"/[a-zA-Z0-9/_.-]+", "<path>", error_msg)
+
+    # Remove IP addresses
+    error_msg = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "<ip>", error_msg)
+
+    # Remove URLs
+    error_msg = re.sub(r"https?://[^\s]+", "<url>", error_msg)
+
+    # Remove token references
+    error_msg = re.sub(r"token[^\s]*", "<token>", error_msg, flags=re.IGNORECASE)
+
+    return error_msg
+
+
+def _extract_pod_status(pod_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract relevant status information from kubectl JSON output.
+
+    Args:
+        pod_data: Full pod object from kubectl JSON output
+
+    Returns:
+        Structured status dictionary
+    """
+
+    metadata = pod_data.get("metadata", {})
+    spec = pod_data.get("spec", {})
+    status = pod_data.get("status", {})
+
+    # Extract phase
+    phase = status.get("phase", "Unknown")
+
+    # Calculate age
+    creation_time = metadata.get("creationTimestamp", "")
+    age = _calculate_pod_age(creation_time) if creation_time else "Unknown"
+
+    # Extract container statuses
+    container_statuses = status.get("containerStatuses", [])
+    ready_containers = sum(
+        1 for c in container_statuses if c.get("ready", False)
+    )
+    total_containers = len(container_statuses)
+
+    # Extract conditions
+    conditions = []
+    for cond in status.get("conditions", []):
+        conditions.append({
+            "type": cond.get("type", ""),
+            "status": cond.get("status", ""),
+            "reason": cond.get("reason", ""),
+            "message": cond.get("message", "")
+        })
+
+    # Calculate total restarts
+    total_restarts = sum(
+        c.get("restartCount", 0) for c in container_statuses
+    )
+
+    # Extract node assignment
+    node_name = spec.get("nodeName", "Unassigned")
+
+    return {
+        "phase": phase,
+        "ready": ready_containers == total_containers,
+        "ready_containers": ready_containers,
+        "total_containers": total_containers,
+        "restart_count": total_restarts,
+        "age": age,
+        "conditions": conditions,
+        "containers": [
+            {
+                "name": c.get("name", ""),
+                "image": c.get("image", ""),
+                "status": c.get("state", {}),
+                "ready": c.get("ready", False),
+                "restarts": c.get("restartCount", 0)
+            }
+            for c in container_statuses
+        ],
+        "node": node_name
+    }
+
+
+def _calculate_pod_age(creation_time: str) -> str:
+    """
+    Calculate pod age from creation timestamp.
+
+    Args:
+        creation_time: ISO format creation timestamp
+
+    Returns:
+        Human-readable age string
+    """
+
+    try:
+        from datetime import datetime as dt
+        created = dt.fromisoformat(creation_time.replace("Z", "+00:00"))
+        now = dt.now(created.tzinfo)
+        delta = now - created
+
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+
+        if days > 0:
+            return f"{days} days"
+        elif hours > 0:
+            return f"{hours} hours"
+        else:
+            return f"{minutes} minutes"
+    except Exception:
+        return "Unknown"
