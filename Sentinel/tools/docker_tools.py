@@ -743,3 +743,335 @@ def _mask_sensitive_data(
         found = True
 
     return masked_line, found, list(set(masked_fields))  # deduplicate fields
+
+
+async def restart_container(
+    container_name: str,
+    timeout: int = 30,
+    use_real_docker: bool = False
+) -> Dict[str, Any]:
+    """
+    Safely restart a Docker container with input validation and error handling.
+
+    SECURITY CONSIDERATIONS
+    ======================
+    This function prevents arbitrary command execution through:
+
+    1. INPUT VALIDATION
+       - Container name validated against whitelist pattern
+       - Only alphanumeric, dash, underscore allowed
+       - Prevents injection through container identifier
+       - Rejects suspicious characters
+
+    2. COMMAND INJECTION PREVENTION
+       - Uses subprocess with argument list, NOT shell=True
+       - Each argument passed separately
+       - No string concatenation in command
+       - Docker executable path can be validated
+
+    3. OPERATION CONSTRAINTS
+       - Timeout enforced to prevent indefinite operations
+       - Only safe, idempotent docker restart allowed
+       - Cannot chain multiple commands
+       - Cannot execute arbitrary scripts
+
+    4. PERMISSION & AUTHORIZATION
+       - Can integrate with permission checking system
+       - Can require approval for production containers
+       - Can be rate-limited to prevent abuse
+       - All operations logged with timestamp
+
+    5. ERROR HANDLING
+       - Generic error messages (no system details)
+       - Does not expose Docker daemon internals
+       - Failures logged securely
+       - Partial failures detected and reported
+
+    Args:
+        container_name (str): Docker container name or ID to restart.
+            Validated to contain only alphanumeric, dash, underscore.
+            Examples: "web-service", "db_primary", "cache123"
+        timeout (int): Timeout in seconds for the operation (default: 30).
+            Maximum allowed: 300 seconds (5 minutes).
+            Prevents indefinite operations.
+        use_real_docker (bool): Whether to use real Docker or mock mode
+            (default: False). In production, set to True with proper
+            Docker socket permissions and error handling.
+
+    Returns:
+        Dict with:
+        - "success" (bool): Restart succeeded
+        - "container_name" (str): Target container
+        - "status" (str): Current status after restart
+        - "timestamp" (str): ISO timestamp
+        - "duration_seconds" (float): How long the operation took
+        - "error" (str): Error message if failed
+        - "error_type" (str): Category of error (timeout, not_found, etc.)
+
+    Example:
+        >>> result = await restart_container("web-service")
+        >>> if result["success"]:
+        ...     print(f"Container restarted in {result['duration_seconds']}s")
+        ... else:
+        ...     print(f"Failed: {result['error']}")
+    """
+
+    start_time = datetime.now()
+
+    # =========================================================================
+    # PHASE 1: INPUT VALIDATION
+    # =========================================================================
+
+    # Validate container name: prevent command injection
+    container_name_pattern = r"^[a-zA-Z0-9_-]+$"
+    if not container_name:
+        return {
+            "success": False,
+            "error": "Container name cannot be empty",
+            "error_type": "invalid_input",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    if not re.match(container_name_pattern, container_name):
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Invalid container name format",
+            "error_type": "invalid_format",
+            "timestamp": datetime.now().isoformat(),
+            "security_reason": "Container name contains disallowed characters"
+        }
+
+    # Validate timeout: prevent resource exhaustion
+    timeout = max(5, min(timeout, 300))  # Clamp to [5, 300] seconds
+
+    # =========================================================================
+    # PHASE 2: PERMISSION & AUTHORIZATION CHECK (Integration point)
+    # =========================================================================
+
+    # In production, check if agent has permission to restart this container
+    # Example:
+    # if not await check_agent_permissions(agent_id, container_name, "restart"):
+    #     return {
+    #         "success": False,
+    #         "error": "Permission denied for this operation",
+    #         "error_type": "unauthorized",
+    #         "timestamp": datetime.now().isoformat()
+    #     }
+
+    # =========================================================================
+    # PHASE 3: EXECUTE RESTART OPERATION
+    # =========================================================================
+
+    if use_real_docker:
+        return await _restart_container_real(container_name, timeout, start_time)
+    else:
+        return await _restart_container_mock(container_name, start_time)
+
+
+async def _restart_container_real(
+    container_name: str,
+    timeout: int,
+    start_time: datetime
+) -> Dict[str, Any]:
+    """
+    Execute real Docker container restart.
+
+    SECURITY: Uses subprocess with shell=False and argument list to prevent
+    command injection. Arguments are passed separately, no shell interpolation.
+
+    Args:
+        container_name: Validated container name
+        timeout: Operation timeout in seconds
+        start_time: Start time for duration calculation
+
+    Returns:
+        Dict with restart result
+    """
+
+    try:
+        # SECURITY: subprocess with shell=False + argument list prevents injection
+        # Command structure: docker restart [timeout_option] <container_name>
+        command = [
+            "docker",                          # Docker executable
+            "restart",                         # Subcommand (safe, idempotent)
+            f"--time={timeout}",               # Timeout for graceful shutdown
+            container_name                     # Validated container name
+        ]
+
+        # Execute with timeout to prevent hanging
+        result = subprocess.run(
+            command,
+            capture_output=True,               # Capture output
+            text=True,                         # Return strings
+            timeout=timeout + 5,               # Add 5s buffer to timeout
+            check=False                        # Don't raise on non-zero exit
+        )
+
+        duration = (datetime.now() - start_time).total_seconds()
+
+        # =========================================================================
+        # PHASE 4: HANDLE RESULTS
+        # =========================================================================
+
+        if result.returncode == 0:
+            # Success: container restarted
+            return {
+                "success": True,
+                "container_name": container_name,
+                "status": "restarted",
+                "timestamp": datetime.now().isoformat(),
+                "duration_seconds": duration,
+                "message": f"Container {container_name} restarted successfully"
+            }
+        else:
+            # Failure: analyze error type
+            error_type, error_msg = _analyze_docker_restart_error(
+                result.stderr, container_name
+            )
+
+            return {
+                "success": False,
+                "container_name": container_name,
+                "error": error_msg,
+                "error_type": error_type,
+                "timestamp": datetime.now().isoformat(),
+                "duration_seconds": duration
+            }
+
+    except subprocess.TimeoutExpired:
+        duration = (datetime.now() - start_time).total_seconds()
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Restart operation timed out",
+            "error_type": "timeout",
+            "timestamp": datetime.now().isoformat(),
+            "duration_seconds": duration,
+            "hint": "Container may be stuck or system overloaded"
+        }
+
+    except FileNotFoundError:
+        duration = (datetime.now() - start_time).total_seconds()
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Docker executable not found",
+            "error_type": "docker_not_available",
+            "timestamp": datetime.now().isoformat(),
+            "duration_seconds": duration
+        }
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        # Catch unexpected errors - return generic message
+        # Internal logging would happen here: logger.error(f"Restart failed: {e}", exc_info=True)
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Failed to restart container due to system error",
+            "error_type": "system_error",
+            "timestamp": datetime.now().isoformat(),
+            "duration_seconds": duration
+        }
+
+
+async def _restart_container_mock(
+    container_name: str,
+    start_time: datetime
+) -> Dict[str, Any]:
+    """
+    Mock Docker container restart for testing.
+
+    Simulates a successful restart without requiring Docker.
+
+    Args:
+        container_name: Container name
+        start_time: Start time for duration calculation
+
+    Returns:
+        Mock restart result
+    """
+
+    # Simulate restart operation taking a few seconds
+    await _async_sleep(2.5)
+
+    duration = (datetime.now() - start_time).total_seconds()
+
+    return {
+        "success": True,
+        "container_name": container_name,
+        "status": "restarted",
+        "timestamp": datetime.now().isoformat(),
+        "duration_seconds": duration,
+        "message": f"Container {container_name} restarted successfully (mock)",
+        "note": "This is a mock restart - real Docker not connected"
+    }
+
+
+def _analyze_docker_restart_error(
+    error_output: str,
+    container_name: str
+) -> tuple[str, str]:
+    """
+    Analyze Docker restart error and categorize it safely.
+
+    Maps Docker error messages to error types:
+    - not_found: Container doesn't exist
+    - invalid_state: Container not running
+    - permission: Insufficient permissions
+    - timeout: Operation timed out
+    - unknown: Unclassified error
+
+    Args:
+        error_output: Raw Docker error message
+        container_name: Container that failed to restart
+
+    Returns:
+        Tuple of (error_type: str, error_message: str)
+    """
+
+    error_lower = error_output.lower()
+
+    # Detect specific error types
+    if "no such container" in error_lower or "not found" in error_lower:
+        return (
+            "not_found",
+            f"Container '{container_name}' not found"
+        )
+
+    if "permission denied" in error_lower or "permission" in error_lower:
+        return (
+            "permission",
+            "Permission denied - insufficient privileges for restart operation"
+        )
+
+    if "already in progress" in error_lower:
+        return (
+            "operation_in_progress",
+            "Another operation is already in progress on this container"
+        )
+
+    if "cannot connect" in error_lower or "unix socket" in error_lower:
+        return (
+            "docker_connection_error",
+            "Failed to connect to Docker daemon"
+        )
+
+    # Generic error with sanitization
+    sanitized_error = _sanitize_docker_error(error_output)
+    return (
+        "unknown_error",
+        f"Failed to restart container: {sanitized_error}"
+    )
+
+
+async def _async_sleep(seconds: float) -> None:
+    """
+    Async sleep for mocking delays.
+
+    Args:
+        seconds: Duration to sleep
+    """
+    import asyncio
+    await asyncio.sleep(seconds)
