@@ -4,3 +4,15 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+
+# Vector Store (ChromaDB)
+# -----------------------
+# ChromaDB provides persistent vector storage for semantic search.
+# Used for storing embeddings of runbooks, incidents, and knowledge base.
+chromadb>=0.4.0
+
+# Sentence Transformers (Embeddings)
+# -----------------------------------
+# Provides local embedding models. Default: all-MiniLM-L6-v2
+# Runs entirely locally - no API key required.
+sentence-transformers>=2.2.0
