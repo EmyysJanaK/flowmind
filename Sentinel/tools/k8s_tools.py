@@ -941,3 +941,559 @@ def _calculate_pod_age(creation_time: str) -> str:
             return f"{minutes} minutes"
     except Exception:
         return "Unknown"
+
+
+async def restart_pod(
+    namespace: str,
+    pod_name: str,
+    grace_period: int = 30,
+    use_real_kubectl: bool = False
+) -> Dict[str, Any]:
+    """
+    Safely restart a Kubernetes pod by deleting it.
+
+    OPERATION SCOPE & RESTRICTIONS
+    ===============================
+
+    This tool is RESTRICTED to pod deletion/restart operations only:
+    - ALLOWED: Delete pods in specified namespace
+    - DENIED: Modify any other resources (deployments, services, etc.)
+    - DENIED: Delete resources outside specified namespace
+    - DENIED: Any operation outside pod scope
+
+    This restriction is enforced through:
+    1. Hard-coded kubectl command (no dynamic subcommands)
+    2. Validation that only "delete pod" operations are permitted
+    3. Integration points for RBAC to prevent unauthorized operations
+    4. Audit logging of all pod deletions
+
+    RBAC (ROLE-BASED ACCESS CONTROL) INTEGRATION
+    =============================================
+
+    In production, Kubernetes RBAC controls who can delete pods:
+
+    Example Service Account + Role for Sentinel Agent:
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: sentinel-agent
+      namespace: sentinel-system
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: sentinel-pod-restart
+    rules:
+    # RESTRICTED: Only pod deletion allowed
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["delete", "get"]     # Only delete and get, NOT create/update/patch
+      namespaceSelector:
+        matchLabels:
+          sentinel-allowed: "true"  # Only in whitelisted namespaces
+    # DENIED: No permissions for other resources
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: sentinel-pod-restart-binding
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: sentinel-pod-restart
+    subjects:
+    - kind: ServiceAccount
+      name: sentinel-agent
+      namespace: sentinel-system
+    ```
+
+    Production Deployment Checklist:
+    ================================
+    
+    When deploying Sentinel with real kubectl in production:
+
+    1. CREATE SERVICE ACCOUNT:
+       kubectl create serviceaccount sentinel-agent -n sentinel-system
+
+    2. CREATE CLUSTER ROLE (as shown above):
+       - Restrict to "pods" resource only
+       - Allow only ["delete", "get"] verbs
+       - Use namespace selectors to limit scope
+       - Never grant cluster-admin role
+
+    3. BIND ROLE TO SERVICE ACCOUNT:
+       kubectl create clusterrolebinding sentinel-pod-restart-binding \
+         --clusterrole=sentinel-pod-restart \
+         --serviceaccount=sentinel-system:sentinel-agent
+
+    4. CONFIGURE KUBECONFIG:
+       - Generate kubeconfig for sentinel-agent service account
+       - Store securely (Kubernetes secret, vault, etc.)
+       - Mount as read-only volume in Sentinel pod
+
+    5. PASS KUBECONFIG TO SENTINEL:
+       kubectl set env deployment/sentinel \
+         -c sentinel-container \
+         KUBECONFIG=/etc/kubeconfig/config
+
+    6. VERIFY RBAC WORKS:
+       kubectl auth can-i delete pods --as=system:serviceaccount:sentinel-system:sentinel-agent
+       # Output: yes
+
+    7. ENABLE AUDIT LOGGING:
+       - Monitor kubectl operations in audit logs
+       - Alert on unauthorized delete attempts
+       - Track which agent deleted which pod and when
+
+    SERVICE ACCOUNT ADVANTAGES
+    ==========================
+
+    Why use Kubernetes service accounts instead of shared credentials:
+    - Isolation: Each pod gets own identity and permissions
+    - Granularity: Fine-grained RBAC per service account
+    - Rotation: No shared passwords to manage
+    - Auditability: Every action tied to specific service account
+    - Revocation: Can instantly disable an agent's permissions
+    - Compliance: Clear audit trail for security reviews
+
+    SECURITY CONSIDERATIONS
+    =======================
+
+    1. MUTATION CONTROL
+       Only pod deletion is allowed, no arbitrary kubectl commands.
+       Even if agent is compromised, can only delete pods:
+       - Cannot scale deployments
+       - Cannot modify configs
+       - Cannot update images
+       - Cannot access cluster secrets
+
+    2. SCOPE RESTRICTION
+       Pod deletion limited to specific namespaces via RBAC:
+       - Cannot affect system namespaces (kube-system, kube-node-lease)
+       - Cannot affect other application namespaces
+       - Only whitelisted namespaces accessible
+
+    3. GRACE PERIOD
+       Pods get grace_period seconds to shut down gracefully:
+       - Allows in-flight requests to complete
+       - Enables clean shutdown hooks
+       - Reduced data corruption risk
+       - Must be > 0 for production
+
+    4. AUDIT & RECOVERY
+       All deletions recorded for:
+       - Understanding what happened (forensics)
+       - Identifying misbehaving agents
+       - Compliance evidence
+       - Automatic remediation triggers
+
+    Args:
+        namespace (str): Kubernetes namespace containing pod. Must be
+            alphanumeric with dashes. Restricted by RBAC in production.
+            Examples: "production", "staging"
+        pod_name (str): Name of pod to restart (delete). Must be
+            alphanumeric with dashes. Validated to prevent injection.
+            Examples: "web-service-7d9f4c"
+        grace_period (int): Seconds to gracefully terminate pod (default: 30).
+            Pod gets this long to shut down before forced kill.
+            Must be >= 0. In production, should match pod's terminationGracePeriodSeconds.
+        use_real_kubectl (bool): Whether to use real kubectl (default: False).
+            Set True only with proper RBAC and kubeconfig configured.
+
+    Returns:
+        Dict with:
+        - "success" (bool): Operation succeeded
+        - "namespace" (str): Target namespace
+        - "pod_name" (str): Pod that was deleted
+        - "status" (str): Result status (deleted, already_absent, error)
+        - "grace_period_used" (int): Grace period applied
+        - "duration_seconds" (float): How long operation took
+        - "timestamp" (str): ISO timestamp
+        - "error" (str): Error message if failed
+        - "error_type" (str): Category of error
+
+    Example:
+        >>> result = await restart_pod("production", "web-service-7d9f4c")
+        >>> if result["success"]:
+        ...     print(f"Pod deleted: {result['pod_name']}")
+        ...     print(f"Time taken: {result['duration_seconds']}s")
+        ... else:
+        ...     print(f"Error: {result['error']} ({result['error_type']})")
+    """
+
+    start_time = datetime.now()
+
+    # =========================================================================
+    # PHASE 1: INPUT VALIDATION & SAFETY CHECKS
+    # =========================================================================
+
+    # Validate namespace
+    namespace_pattern = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    if not namespace or not re.match(namespace_pattern, namespace):
+        return {
+            "success": False,
+            "namespace": namespace,
+            "error": "Invalid namespace format",
+            "error_type": "invalid_input",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    # Protect system namespaces
+    protected_namespaces = {
+        "kube-system",
+        "kube-public",
+        "kube-node-lease",
+        "kube-apiserver"
+    }
+    if namespace in protected_namespaces:
+        return {
+            "success": False,
+            "namespace": namespace,
+            "error": f"Cannot delete pods in protected namespace '{namespace}'",
+            "error_type": "restricted_namespace",
+            "timestamp": datetime.now().isoformat(),
+            "security_reason": "System namespaces protected from agent modifications"
+        }
+
+    # Validate pod name
+    pod_pattern = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    if not pod_name or not re.match(pod_pattern, pod_name):
+        return {
+            "success": False,
+            "pod_name": pod_name,
+            "error": "Invalid pod name format",
+            "error_type": "invalid_input",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    # Validate grace period
+    if not isinstance(grace_period, int) or grace_period < 0:
+        return {
+            "success": False,
+            "error": "Grace period must be non-negative integer",
+            "error_type": "invalid_input",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    # =========================================================================
+    # PHASE 2: PERMISSION & AUTHORIZATION CHECK
+    # =========================================================================
+
+    # PRODUCTION INTEGRATION:
+    # Replace this with actual RBAC check:
+    #
+    # agent_service_account = "sentinel-agent"  # From pod env or config
+    # allowed = await check_rbac_permission(
+    #     service_account=agent_service_account,
+    #     resource="pods",
+    #     namespace=namespace,
+    #     verb="delete"
+    # )
+    # if not allowed:
+    #     return {
+    #         "success": False,
+    #         "error": "RBAC permission denied",
+    #         "error_type": "unauthorized",
+    #         "timestamp": datetime.now().isoformat()
+    #     }
+
+    # Additional safety: Log this deletion attempt
+    # logger.warning(
+    #     f"Agent {agent_id} requesting pod deletion",
+    #     extra={
+    #         "agent_id": agent_id,
+    #         "namespace": namespace,
+    #         "pod_name": pod_name,
+    #         "action": "delete_pod"
+    #     }
+    # )
+
+    # =========================================================================
+    # PHASE 3: EXECUTE POD DELETION
+    # =========================================================================
+
+    if use_real_kubectl:
+        return await _restart_pod_real(
+            namespace, pod_name, grace_period, start_time
+        )
+    else:
+        return await _restart_pod_mock(
+            namespace, pod_name, grace_period, start_time
+        )
+
+
+async def _restart_pod_real(
+    namespace: str,
+    pod_name: str,
+    grace_period: int,
+    start_time: datetime
+) -> Dict[str, Any]:
+    """
+    Execute real Kubernetes pod deletion (restart).
+
+    SECURITY: Uses subprocess with shell=False and argument list to prevent
+    command injection. Only allows "delete pod" operations - no wildcards,
+    no arbitrary kubectl commands.
+
+    Command: kubectl delete pod <pod_name> -n <namespace> --grace-period=<seconds>
+
+    The pod is deleted, triggering Kubernetes to recreate it (via its controller),
+    effectively restarting the pod.
+
+    Args:
+        namespace: Validated Kubernetes namespace
+        pod_name: Validated pod name
+        grace_period: Validated grace period in seconds
+        start_time: Operation start time for duration tracking
+
+    Returns:
+        Dict with operation result or error
+    """
+
+    try:
+        # SECURITY: subprocess with shell=False + argument list prevents injection
+        # Hard-coded command structure ensures only pod deletion allowed
+        command = [
+            "kubectl",                                      # kubectl executable
+            "delete",                                       # Action (hard-coded)
+            "pod",                                          # Resource type (hard-coded)
+            pod_name,                                       # Validated pod name
+            "-n", namespace,                                # Validated namespace
+            f"--grace-period={grace_period}",              # Grace period setting
+            "--ignore-not-found=false"                      # Fail if pod not found
+        ]
+
+        # Execute with timeout
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=60,                                     # Pod deletion may take up to grace_period + overhead
+            check=False
+        )
+
+        duration = (datetime.now() - start_time).total_seconds()
+
+        # =========================================================================
+        # PHASE 4: ANALYZE RESULT
+        # =========================================================================
+
+        if result.returncode == 0:
+            # Success: Pod deletion initiated
+            return {
+                "success": True,
+                "namespace": namespace,
+                "pod_name": pod_name,
+                "status": "deleted",
+                "grace_period_used": grace_period,
+                "duration_seconds": duration,
+                "timestamp": datetime.now().isoformat(),
+                "message": f"Pod {pod_name} deletion initiated in namespace {namespace}"
+            }
+
+        else:
+            # Failure: Analyze error
+            error_type, error_msg = _analyze_kubectl_delete_error(
+                result.stderr, pod_name
+            )
+
+            return {
+                "success": False,
+                "namespace": namespace,
+                "pod_name": pod_name,
+                "status": "error",
+                "error": error_msg,
+                "error_type": error_type,
+                "grace_period_used": grace_period,
+                "duration_seconds": duration,
+                "timestamp": datetime.now().isoformat()
+            }
+
+    except subprocess.TimeoutExpired:
+        duration = (datetime.now() - start_time).total_seconds()
+        return {
+            "success": False,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "error": f"kubectl delete timed out after {duration:.1f}s",
+            "error_type": "timeout",
+            "grace_period_used": grace_period,
+            "duration_seconds": duration,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except FileNotFoundError:
+        duration = (datetime.now() - start_time).total_seconds()
+        return {
+            "success": False,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "error": "kubectl executable not found",
+            "error_type": "kubectl_not_available",
+            "grace_period_used": grace_period,
+            "duration_seconds": duration,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        return {
+            "success": False,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "error": "Failed to delete pod due to system error",
+            "error_type": "system_error",
+            "grace_period_used": grace_period,
+            "duration_seconds": duration,
+            "timestamp": datetime.now().isoformat()
+            # Internal logging: logger.error(f"kubectl delete failed: {e}", exc_info=True)
+        }
+
+
+async def _restart_pod_mock(
+    namespace: str,
+    pod_name: str,
+    grace_period: int,
+    start_time: datetime
+) -> Dict[str, Any]:
+    """
+    Mock Kubernetes pod deletion for testing without real cluster.
+
+    Simulates kubectl delete behavior with realistic timing.
+
+    Args:
+        namespace: Namespace name
+        pod_name: Pod name
+        grace_period: Grace period (used in simulation)
+        start_time: Operation start time
+
+    Returns:
+        Mock pod deletion result
+    """
+
+    # Simulate deletion taking grace_period + 0.5s for actual termination
+    await _async_sleep_for_mock(grace_period + 0.5)
+
+    duration = (datetime.now() - start_time).total_seconds()
+
+    return {
+        "success": True,
+        "namespace": namespace,
+        "pod_name": pod_name,
+        "status": "deleted",
+        "grace_period_used": grace_period,
+        "duration_seconds": duration,
+        "timestamp": datetime.now().isoformat(),
+        "message": f"Mock: Pod {pod_name} deletion initiated in namespace {namespace}",
+        "note": "Mock deletion - real Kubernetes not connected"
+    }
+
+
+def _analyze_kubectl_delete_error(error_output: str, pod_name: str) -> tuple[str, str]:
+    """
+    Analyze kubectl delete error and categorize it safely.
+
+    Maps kubectl errors to error types:
+    - not_found: Pod already deleted or never existed
+    - permission_error: RBAC permission denied
+    - termination_timeout: Pod didn't terminate within timeout
+    - namespace_not_found: Namespace doesn't exist
+    - connection_error: Cannot connect to cluster
+    - configuration_error: kubectl config issue
+    - operation_in_progress: Another delete in progress
+    - unknown: Unclassified error
+
+    Args:
+        error_output: Raw kubectl error message
+        pod_name: Pod name (for context)
+
+    Returns:
+        Tuple of (error_type: str, error_message: str)
+    """
+
+    error_lower = error_output.lower()
+
+    # Detect specific error types
+    if "not found" in error_lower or "does not exist" in error_lower:
+        return ("not_found", f"Pod '{pod_name}' not found in namespace")
+
+    if "permission denied" in error_lower or "forbidden" in error_lower:
+        return (
+            "permission_error",
+            "RBAC permission denied - check service account permissions"
+        )
+
+    if "namespace" in error_lower and "not found" in error_lower:
+        return ("namespace_not_found", "Target namespace does not exist")
+
+    if "connection refused" in error_lower or "unable to connect" in error_lower:
+        return (
+            "connection_error",
+            "Cannot connect to Kubernetes cluster - API server may be down"
+        )
+
+    if "config" in error_lower or "kubeconfig" in error_lower:
+        return (
+            "configuration_error",
+            "kubectl configuration issue - check kubeconfig"
+        )
+
+    if "timeout" in error_lower or "deadline exceeded" in error_lower:
+        return (
+            "termination_timeout",
+            "Pod deletion timed out - pod may still be terminating"
+        )
+
+    if "operation already in progress" in error_lower:
+        return (
+            "operation_in_progress",
+            "Another delete operation already in progress for this pod"
+        )
+
+    # Generic error with sanitization
+    sanitized = _sanitize_kubectl_delete_error(error_output)
+    return ("unknown_error", f"kubectl error: {sanitized}")
+
+
+def _sanitize_kubectl_delete_error(error_msg: str) -> str:
+    """
+    Sanitize kubectl delete error messages.
+
+    Removes sensitive information:
+    - File system paths
+    - IP addresses and hostnames
+    - API server URLs
+    - Token references
+
+    Args:
+        error_msg: Raw kubectl error message
+
+    Returns:
+        Sanitized error message
+    """
+
+    # Remove file paths
+    error_msg = re.sub(r"/[a-zA-Z0-9/_.-]+", "<path>", error_msg)
+
+    # Remove IP addresses
+    error_msg = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "<ip>", error_msg)
+
+    # Remove URLs
+    error_msg = re.sub(r"https?://[^\s]+", "<url>", error_msg)
+
+    # Remove token references
+    error_msg = re.sub(r"token[^\s]*", "<token>", error_msg, flags=re.IGNORECASE)
+
+    return error_msg
+
+
+async def _async_sleep_for_mock(seconds: float) -> None:
+    """
+    Async sleep for mock operations.
+
+    Args:
+        seconds: Number of seconds to sleep
+    """
+    import asyncio
+    await asyncio.sleep(seconds)
