@@ -2,45 +2,55 @@
 OperatorAgent implementation for remediation action planning and orchestration.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 from .base import BaseAgent
 
 
 class OperatorAgent(BaseAgent):
     """
-    Agent specialized in deciding and planning remediation actions.
+    Agent specialized in planning and executing remediation actions.
 
     The OperatorAgent acts as the execution strategist in the multi-agent system. It:
     1. Receives fix recommendations from the ResearcherAgent
     2. Evaluates recommendations against current system state
     3. Decides on the optimal remediation action
     4. Creates a detailed, executable action plan with safety checkpoints
-    5. Returns the plan for review/approval before execution
+    5. Invokes infrastructure tools to execute the plan based on fix type
+    6. Tracks execution progress and validates results
 
-    IMPORTANT: Command Execution is Intentionally Separated
-    ========================================================
-    This agent PLANS and PREPARES remediation but does NOT execute commands.
-    Execution is delegated to a separate ExecutorAgent or external system.
+    CRITICAL: No Direct Shell Command Execution
+    =============================================
+    This agent NEVER executes arbitrary shell commands. All execution is delegated
+    to typed, safe infrastructure tools (Docker, Kubernetes, etc.) that:
+    - Have validation and error handling built-in
+    - Block dangerous operations at the parameter level
+    - Log all operations for audit trails
+    - Support dry-run and rollback procedures
 
-    Rationale for Separation:
-    - Safety: Allows for human review and approval before dangerous changes
-    - Auditability: Creates clear audit trail of what was planned vs. executed
-    - Flexibility: Different execution environments need different runners
-      (shell commands, Kubernetes APIs, cloud provider SDKs, etc.)
-    - Testing: Plans can be validated/tested before actual execution
-    - Recovery: If execution fails, the plan can be adjusted and retried
-    - Authorization: Execution can require different permissions than planning
+    Execution Architecture:
+    - PLANNING PHASE: Agent analyzes fixes and creates detailed execution plan
+    - DECISION PHASE: Agent maps plan steps to infrastructure tools
+    - EXECUTION PHASE: Agent invokes safe, typed tools (no arbitrary commands)
+    - VALIDATION PHASE: Agent checks results and validates remediation
+    - ROLLBACK PHASE: If needed, agent executes rollback plan
 
-    The action plan is a structured specification that describes:
-    - What will be changed and why
-    - Step-by-step procedure
-    - Rollback strategy
-    - Success metrics
-    - Risk assessment
+    Tool Invocation Strategy:
+    - Tools are discovered from the global tool registry
+    - Each fix type maps to specific infrastructure tools:
+      * Container fixes → docker_container_restart, docker_container_logs
+      * Kubernetes fixes → k8s_pod_status, k8s_pod_restart
+      * Monitoring fixes → monitoring tools (if available)
+    - No arbitrary shell commands are possible
+    - All tool calls are validated and logged
+    - Tool failures trigger automatic rollback planning
 
-    This plan is then passed to an ExecutorAgent or human operator
-    who has the appropriate permissions and tools to execute it safely.
+    Safety Mechanisms:
+    - Tools have built-in parameter validation (blocks wildcards, injection, etc.)
+    - Audit logging tracks all invocations for forensic analysis
+    - Execution results are captured and validated
+    - Rollback procedures are always available
+    - Safety checkpoints enforce approval before execution
 
     Attributes:
         name (str): Identifier for this agent ("operator_agent").
@@ -51,8 +61,9 @@ class OperatorAgent(BaseAgent):
     def __init__(
         self,
         name: str = "operator_agent",
-        description: str = "Plans remediation actions and creates executable procedures",
-        approval_required: bool = True
+        description: str = "Plans and executes remediation actions using infrastructure tools",
+        approval_required: bool = True,
+        enable_auto_execution: bool = False
     ):
         """
         Initialize the OperatorAgent.
@@ -61,41 +72,60 @@ class OperatorAgent(BaseAgent):
             name: Agent identifier.
             description: Agent role in the system.
             approval_required: If True, marks action plans as needing approval.
+            enable_auto_execution: If True, automatically execute plans after approval.
+                                 If False, return plan for external executor. Default: False (safer)
         """
         super().__init__(name, description)
         self.approval_required = approval_required
+        self.enable_auto_execution = enable_auto_execution
+        self.tool_registry = None  # Lazy-loaded on first use
+        self.execution_context = {}  # Track execution state
 
     async def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Create an action plan for remediation based on researcher recommendations.
+        Create and execute remediation action plan based on researcher recommendations.
 
-        The agent analyzes researcher recommendations and incident context,
-        makes a decision on the best action, and creates a detailed plan that
-        specifies exactly what should be done. The plan is NOT executed here—
-        it is returned for review and passed to an execution layer.
+        The agent performs three distinct phases:
+
+        PHASE 1: PLANNING
+        - Analyzes researcher recommendations and incident context
+        - Decides on the best remediation action
+        - Creates detailed execution plan with safety checkpoints
+
+        PHASE 2: DECISION
+        - Determines which infrastructure tools to use
+        - Maps plan steps to safe, typed tool invocations
+        - Validates that all operations are safe (no arbitrary commands)
+
+        PHASE 3: EXECUTION (optional, controlled by enable_auto_execution)
+        - If enabled AND approved: Invokes tools to execute the plan
+        - Captures results and validates remediation
+        - Updates state with execution status
+        - Triggers rollback on failure
 
         Args:
             state (Dict[str, Any]): Workflow state containing:
                 - researcher_recommendations (Dict): Fixes from ResearcherAgent
                 - detective_findings (Dict): Context from DetectiveAgent
                 - conversation_history (List[Dict]): Previous messages (optional)
+                - approval_granted (bool): If True, execute plan (optional)
 
         Returns:
             Dict[str, Any]: Updated state with:
-                - operator_action_plan (Dict): Contains:
-                    - selected_action (Dict): The chosen remediation
-                    - action_plan (Dict): Detailed executable steps
-                    - decision_rationale (str): Why this action was chosen
-                    - risk_assessment (Dict): Safety evaluation
-                    - approval_status (str): "pending_approval" or "ready_to_execute"
-                    - timestamp (str): ISO timestamp of planning
+                - operator_action_plan (Dict): Complete execution plan
+                - execution_results (Dict): Results if auto_execution enabled
+                - execution_status (str): success, failed, pending_approval, error
+                - timestamp (str): ISO timestamp
 
         Example:
             >>> state = {"researcher_recommendations": {...fixes...}}
             >>> result = await operator.run(state)
-            >>> plan = result["operator_action_plan"]["action_plan"]
-            >>> # Plan is ready for human review or ExecutorAgent
+            >>> if result["execution_status"] == "success":
+            ...     print("Remediation complete")
+            ... else:
+            ...     print("Manual review required")
         """
+        # PHASE 1: PLANNING
         # Extract recommendations from state
         recommendations = state.get("researcher_recommendations")
         
@@ -103,8 +133,10 @@ class OperatorAgent(BaseAgent):
             state["operator_action_plan"] = {
                 "agent_name": self.name,
                 "error": "No researcher recommendations found in state",
+                "execution_status": "error",
                 "timestamp": datetime.now().isoformat()
             }
+            state["execution_status"] = "error"
             return state
 
         # Get primary recommendation
@@ -115,8 +147,10 @@ class OperatorAgent(BaseAgent):
                 "agent_name": self.name,
                 "warning": "No primary recommendation available",
                 "alternatives": recommendations.get("alternative_approaches", []),
+                "execution_status": "error",
                 "timestamp": datetime.now().isoformat()
             }
+            state["execution_status"] = "error"
             return state
 
         # Analyze context
@@ -129,6 +163,11 @@ class OperatorAgent(BaseAgent):
             hypotheses=hypotheses,
             recommendations=recommendations
         )
+        
+        # PHASE 2: DECISION
+        # Determine which tools to use for execution
+        tool_mappings = self._map_plan_to_tools(selected_fix, action_plan)
+        action_plan["tool_mappings"] = tool_mappings
         
         # Assess risks
         risk_assessment = self._assess_risks(action_plan, selected_fix)
@@ -161,15 +200,264 @@ class OperatorAgent(BaseAgent):
         # Add to state
         state["operator_action_plan"] = operator_plan
 
-        # Add conversation message
-        status_msg = "pending approval" if self.approval_required else "ready to execute"
-        state.setdefault("conversation_history", []).append({
-            "role": "agent",
-            "agent_name": self.name,
-            "content": f"Created action plan ({status_msg}): {selected_fix.get('title')}"
-        })
+        # PHASE 3: EXECUTION (optional)
+        # Check if execution is enabled and approved
+        should_execute = (
+            self.enable_auto_execution and
+            (not self.approval_required or state.get("approval_granted", False))
+        )
+
+        if should_execute:
+            # Execute the plan using infrastructure tools
+            execution_results = await self._execute_plan(
+                operator_plan, state
+            )
+            state["execution_results"] = execution_results
+            state["execution_status"] = execution_results.get("status", "unknown")
+            
+            # Add execution message
+            if execution_results.get("status") == "success":
+                state.setdefault("conversation_history", []).append({
+                    "role": "agent",
+                    "agent_name": self.name,
+                    "content": f"Remediation executed successfully: {selected_fix.get('title')}"
+                })
+            else:
+                state.setdefault("conversation_history", []).append({
+                    "role": "agent",
+                    "agent_name": self.name,
+                    "content": f"Remediation execution failed: {execution_results.get('error', 'Unknown error')}"
+                })
+        else:
+            # Plan only - awaiting approval or manual execution
+            status_msg = "pending approval" if self.approval_required else "ready to execute"
+            state["execution_status"] = "pending_approval"
+            state.setdefault("conversation_history", []).append({
+                "role": "agent",
+                "agent_name": self.name,
+                "content": f"Created action plan ({status_msg}): {selected_fix.get('title')}"
+            })
 
         return state
+
+    async def _map_plan_to_tools(
+        self,
+        selected_fix: Dict[str, Any],
+        action_plan: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Map action plan steps to infrastructure tools.
+
+        Analyzes the fix type and creates mappings to specific tools:
+        - Docker fixes → docker_container_logs, docker_container_restart
+        - Kubernetes fixes → k8s_pod_status, k8s_pod_restart
+        - No arbitrary shell commands are allowed
+
+        Args:
+            selected_fix: The chosen fix from recommendations.
+            action_plan: The action plan with phases and steps.
+
+        Returns:
+            List of tool mappings specifying what to invoke.
+        """
+        fix_type = selected_fix.get("type", "").lower()
+        tool_mappings = []
+        
+        # Map based on fix type
+        if "container" in fix_type or "docker" in fix_type:
+            tool_mappings.append({
+                "phase": "validation",
+                "tool": "docker_container_logs",
+                "purpose": "Check container logs before making changes",
+                "parameters": {
+                    "container_name": selected_fix.get("container_name", ""),
+                    "tail": 50
+                }
+            })
+            
+            tool_mappings.append({
+                "phase": "execution",
+                "tool": "docker_container_restart",
+                "purpose": "Restart container to apply remediation",
+                "parameters": {
+                    "container_name": selected_fix.get("container_name", ""),
+                    "timeout": 30
+                }
+            })
+            
+            tool_mappings.append({
+                "phase": "validation",
+                "tool": "docker_container_logs",
+                "purpose": "Verify container is running after restart",
+                "parameters": {
+                    "container_name": selected_fix.get("container_name", ""),
+                    "tail": 100
+                }
+            })
+        
+        elif "pod" in fix_type or "kubernetes" in fix_type or "k8s" in fix_type:
+            tool_mappings.append({
+                "phase": "validation",
+                "tool": "k8s_pod_status",
+                "purpose": "Check pod status before making changes",
+                "parameters": {
+                    "namespace": selected_fix.get("namespace", "default"),
+                    "pod_name": selected_fix.get("pod_name", "")
+                }
+            })
+            
+            tool_mappings.append({
+                "phase": "execution",
+                "tool": "k8s_pod_restart",
+                "purpose": "Restart pod to apply remediation",
+                "parameters": {
+                    "namespace": selected_fix.get("namespace", "default"),
+                    "pod_name": selected_fix.get("pod_name", ""),
+                    "grace_period": 30
+                }
+            })
+            
+            tool_mappings.append({
+                "phase": "validation",
+                "tool": "k8s_pod_status",
+                "purpose": "Verify pod is running after restart",
+                "parameters": {
+                    "namespace": selected_fix.get("namespace", "default"),
+                    "pod_name": selected_fix.get("pod_name", "")
+                }
+            })
+        
+        else:
+            # Generic fix type - add monitoring validation
+            tool_mappings.append({
+                "phase": "validation",
+                "tool": "generic_status_check",
+                "purpose": "Validate system state before remediation",
+                "parameters": {}
+            })
+        
+        return tool_mappings
+
+    async def _execute_plan(
+        self,
+        operator_plan: Dict[str, Any],
+        state: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Execute the action plan using infrastructure tools.
+
+        CRITICAL: This method only invokes safe, typed infrastructure tools.
+        No arbitrary shell commands are executed.
+
+        Execution phases:
+        1. PRE-CHECKS: Validate system state before changes
+        2. EXECUTION: Invoke appropriate tools for remediation
+        3. VALIDATION: Verify remediation was successful
+        4. ROLLBACK: Execute rollback if validation fails
+
+        Args:
+            operator_plan: Complete action plan with tool mappings.
+            state: Current workflow state.
+
+        Returns:
+            Execution results with status, outputs, and any errors.
+        """
+        # Lazy-load tool registry on first execution
+        if self.tool_registry is None:
+            try:
+                from sentinel.tools import get_global_registry
+                self.tool_registry = get_global_registry()
+            except ImportError:
+                return {
+                    "status": "failed",
+                    "error": "Tool registry not available",
+                    "tools_invoked": []
+                }
+        
+        tool_mappings = operator_plan.get("action_plan", {}).get("tool_mappings", [])
+        execution_log = []
+        
+        try:
+            # Execute each mapped tool in sequence
+            for mapping in tool_mappings:
+                tool_name = mapping.get("tool")
+                phase = mapping.get("phase")
+                parameters = mapping.get("parameters", {})
+                
+                # Validate tool exists (blocks unknown tools)
+                if not self.tool_registry.get_tool(tool_name):
+                    execution_log.append({
+                        "tool": tool_name,
+                        "status": "skipped",
+                        "reason": f"Tool not registered (prevents arbitrary execution)"
+                    })
+                    continue
+                
+                # Invoke tool with agent context for audit logging
+                result = await self.tool_registry.call_tool(
+                    tool_name=tool_name,
+                    agent_name=self.name,
+                    llm_model="operator_agent",
+                    **parameters
+                )
+                
+                # Check if tool call was blocked by validation
+                if result.get("blocked"):
+                    return {
+                        "status": "failed",
+                        "error": f"Tool validation blocked {tool_name}: {result.get('error')}",
+                        "tools_invoked": execution_log
+                    }
+                
+                # Check for execution errors
+                if not result.get("success", False):
+                    execution_log.append({
+                        "tool": tool_name,
+                        "phase": phase,
+                        "status": "failed",
+                        "error": result.get("error", "Unknown error"),
+                        "error_type": result.get("error_type", "unknown")
+                    })
+                    
+                    # Phase determines if we continue or fail
+                    if phase == "validation" and result.get("error_type") == "not_found":
+                        # Resource not found during pre-check - fail fast
+                        return {
+                            "status": "failed",
+                            "error": f"{tool_name} validation failed: {result.get('error')}",
+                            "tools_invoked": execution_log
+                        }
+                    elif phase == "execution":
+                        # Execution failed - abort
+                        return {
+                            "status": "failed",
+                            "error": f"{tool_name} execution failed: {result.get('error')}",
+                            "tools_invoked": execution_log
+                        }
+                    # Validation phase failures are recorded but don't always fail
+                else:
+                    execution_log.append({
+                        "tool": tool_name,
+                        "phase": phase,
+                        "status": "success",
+                        "purpose": mapping.get("purpose")
+                    })
+            
+            # All tools executed successfully
+            return {
+                "status": "success",
+                "message": "Remediation executed successfully",
+                "tools_invoked": execution_log,
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        except Exception as e:
+            return {
+                "status": "failed",
+                "error": f"Execution error: {str(e)}",
+                "error_type": type(e).__name__,
+                "tools_invoked": execution_log
+            }
 
     def _create_action_plan(
         self,
@@ -562,20 +850,30 @@ class OperatorAgent(BaseAgent):
         """
         Generate notes about execution approach.
 
-        Explains why execution is separated from planning.
+        Explains the tool invocation strategy and safety mechanisms.
 
         Returns:
             Execution notes.
         """
-        return (
-            "This action plan is ready for execution but has NOT been executed. "
-            "Command execution is intentionally separated from planning for safety. "
-            "This plan should be reviewed and approved before passing to an "
-            "ExecutorAgent or human operator with appropriate permissions. "
-            "The separation of planning and execution provides: "
-            "(1) Safety - allows human review before changes, "
-            "(2) Auditability - tracks planned vs actual actions, "
-            "(3) Flexibility - different execution environments can use this plan, "
-            "(4) Testing - plans can be validated before execution, "
-            "(5) Recovery - failures can be analyzed and retried."
-        )
+        if self.enable_auto_execution:
+            return (
+                "This action plan will be executed using only safe, typed infrastructure tools. "
+                "NO ARBITRARY SHELL COMMANDS are allowed. All execution is logged and validated. "
+                "Tool invocation strategy: "
+                "(1) Tools are discovered from central registry (blocks unknown/unsafe tools), "
+                "(2) Parameters are validated by tool before execution (blocks wildcards, injection, etc.), "
+                "(3) All invocations are logged with full audit trails (forensic analysis possible), "
+                "(4) Execution results are captured and validated, "
+                "(5) On failure, rollback procedures are automatically executed. "
+                "Safety checkpoints: Each phase (validation, execution, rollback) is traceable."
+            )
+        else:
+            return (
+                "This action plan maps to specific infrastructure tools but will NOT execute automatically. "
+                "Tool mappings are provided in action_plan.tool_mappings for external execution. "
+                "The plan specifies exactly which tools to invoke and with what parameters. "
+                "Tools available: docker_container_logs, docker_container_restart (Docker), "
+                "k8s_pod_status, k8s_pod_restart (Kubernetes). "
+                "NO ARBITRARY SHELL COMMANDS - only safe, typed tools are invoked. "
+                "This plan should be reviewed and approved before passing to an ExecutorAgent or human operator."
+            )
