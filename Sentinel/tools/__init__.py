@@ -37,6 +37,13 @@ from .k8s_tools import (
     KubernetesHealthTool,
     get_k8s_tools
 )
+from .registry import (
+    ToolRegistry,
+    ToolRegistration,
+    ToolCategory,
+    get_registry,
+    initialize_registry
+)
 
 __all__ = [
     "BaseTool",
@@ -47,6 +54,11 @@ __all__ = [
     "KubernetesDeploymentTool",
     "KubernetesScaleTool",
     "KubernetesHealthTool",
-    "get_k8s_tools"
+    "get_k8s_tools",
+    "ToolRegistry",
+    "ToolRegistration",
+    "ToolCategory",
+    "get_registry",
+    "initialize_registry"
 ]
 
