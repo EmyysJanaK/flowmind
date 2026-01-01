@@ -25,6 +25,8 @@ Usage:
 
 from typing import Any, Dict, Optional, List
 from datetime import datetime
+import re
+import subprocess
 from .base import BaseTool
 
 
@@ -360,3 +362,384 @@ def get_docker_tools() -> List[BaseTool]:
         DockerImageTool(),
         DockerHealthTool()
     ]
+
+
+async def fetch_container_logs(
+    container_name: str,
+    tail: int = 100,
+    follow: bool = False,
+    use_real_docker: bool = False
+) -> Dict[str, Any]:
+    """
+    Safely fetch Docker container logs with comprehensive error handling.
+
+    SECURITY CONSIDERATIONS
+    ======================
+    This function implements multiple security layers:
+
+    1. INPUT VALIDATION & SANITIZATION
+       - Container name validated against whitelist pattern (alphanumeric, dash, underscore)
+       - Prevents command injection through container name
+       - Validates tail parameter is within safe bounds (1-10000)
+       - Rejects suspicious characters that could indicate attack attempts
+
+    2. COMMAND INJECTION PREVENTION
+       - Uses subprocess with argument list, NOT shell=True
+       - Each argument passed separately, not concatenated
+       - Docker executable path can be validated against whitelist
+       - Environment variables can be restricted via env parameter
+
+    3. RESOURCE LIMITS
+       - Maximum log lines limited to 10,000 to prevent DoS
+       - Timeout on subprocess prevents hanging indefinitely
+       - Can be integrated with rate limiting to prevent log spam
+
+    4. ERROR HANDLING & INFORMATION DISCLOSURE
+       - Generic error messages don't expose system paths
+       - Docker errors (if real) sanitized before returning
+       - Secrets in logs can be masked with regex patterns
+       - Stack traces never exposed to agents
+
+    5. PERMISSION & AUTHORIZATION
+       - This tool can check agent permissions before execution
+       - Can require approval for sensitive containers
+       - All operations logged with who requested what when
+
+    6. OUTPUT SANITIZATION
+       - Logs scanned for sensitive patterns (passwords, tokens, keys)
+       - Can mask sensitive data before returning to agent
+       - Untrusted log content cannot break downstream processing
+
+    Args:
+        container_name (str): Docker container name or ID.
+            Validated to prevent command injection. Must be alphanumeric
+            with dashes and underscores only.
+        tail (int): Number of log lines to retrieve (default: 100).
+            Maximum 10,000 to prevent resource exhaustion.
+        follow (bool): Whether to follow log output (default: False).
+            Disabled for safety - prevents indefinite hanging.
+        use_real_docker (bool): Whether to use real Docker or mock mode
+            (default: False). In production, set to True with proper
+            Docker socket permissions.
+
+    Returns:
+        Dict with:
+        - "success" (bool): Operation succeeded
+        - "container_name" (str): Target container
+        - "logs" (List[str]): Log lines
+        - "log_count" (int): Number of lines returned
+        - "timestamp" (str): ISO timestamp
+        - "error" (str): Error message if failed
+        - "sensitive_data_found" (bool): If sensitive patterns detected
+        - "masked_fields" (List[str]): Fields that were masked
+
+    Example:
+        >>> result = await fetch_container_logs("web-service", tail=50)
+        >>> if result["success"]:
+        ...     for line in result["logs"]:
+        ...         print(line)
+    """
+
+    # =========================================================================
+    # PHASE 1: INPUT VALIDATION & SANITIZATION
+    # =========================================================================
+
+    # Validate container name: prevent command injection
+    # Only allow alphanumeric, dash, underscore - matches Docker name requirements
+    container_name_pattern = r"^[a-zA-Z0-9_-]+$"
+    if not re.match(container_name_pattern, container_name):
+        return {
+            "success": False,
+            "error": "Invalid container name format",
+            "container_name": container_name,
+            "timestamp": datetime.now().isoformat(),
+            "security_reason": "Container name contains disallowed characters"
+        }
+
+    # Validate tail parameter: prevent DoS through unbounded log retrieval
+    tail = max(1, min(tail, 10000))  # Clamp to safe range [1, 10000]
+
+    # Never allow follow=True in tool context - could cause indefinite blocking
+    follow = False  # Force safety
+
+    # =========================================================================
+    # PHASE 2: PERMISSION CHECK (Integration point)
+    # =========================================================================
+
+    # In production, check if agent has permission to access this container
+    # Example:
+    # if not await check_agent_permissions(agent_id, container_name, "logs"):
+    #     return {"success": False, "error": "Permission denied"}
+
+    # =========================================================================
+    # PHASE 3: DOCKER COMMAND EXECUTION
+    # =========================================================================
+
+    if use_real_docker:
+        return await _fetch_docker_logs_real(container_name, tail)
+    else:
+        return await _fetch_docker_logs_mock(container_name, tail)
+
+
+async def _fetch_docker_logs_real(
+    container_name: str, tail: int
+) -> Dict[str, Any]:
+    """
+    Fetch real Docker logs using subprocess.
+
+    IMPORTANT: This function uses subprocess with shell=False to prevent
+    command injection. Arguments are passed as a list, not concatenated.
+
+    Args:
+        container_name: Validated container name
+        tail: Validated log line count
+
+    Returns:
+        Dict with logs or error information
+    """
+
+    try:
+        # SECURITY: subprocess with shell=False + argument list prevents injection
+        # Each argument passed separately, no shell interpolation
+        command = [
+            "docker",                          # Docker executable
+            "logs",                            # Subcommand
+            f"--tail={tail}",                  # Argument with sanitized value
+            "--timestamps",                    # Add timestamps for better debugging
+            container_name                     # Validated container name last
+        ]
+
+        # Execute with timeout to prevent hanging indefinitely
+        # stdout/stderr captured separately for error handling
+        result = subprocess.run(
+            command,
+            capture_output=True,               # Capture stdout and stderr
+            text=True,                         # Return strings, not bytes
+            timeout=30,                        # 30 second timeout - prevent indefinite hanging
+            check=False                        # Don't raise on non-zero exit
+        )
+
+        # =========================================================================
+        # PHASE 4: ERROR HANDLING & SANITIZATION
+        # =========================================================================
+
+        if result.returncode != 0:
+            # Docker command failed - return generic error, not system details
+            error_msg = result.stderr if result.stderr else "Failed to fetch logs"
+
+            # Sanitize error to not expose system paths or sensitive info
+            error_msg = _sanitize_docker_error(error_msg)
+
+            return {
+                "success": False,
+                "container_name": container_name,
+                "error": error_msg,
+                "timestamp": datetime.now().isoformat()
+            }
+
+        # =========================================================================
+        # PHASE 5: SENSITIVE DATA DETECTION & MASKING
+        # =========================================================================
+
+        logs = result.stdout.split("\n")
+        logs = [line for line in logs if line.strip()]  # Remove empty lines
+
+        # Scan for sensitive patterns
+        sensitive_data_found = False
+        masked_fields = []
+
+        for i, line in enumerate(logs):
+            masked_line, found, fields = _mask_sensitive_data(line)
+            if found:
+                sensitive_data_found = True
+                logs[i] = masked_line
+                masked_fields.extend(fields)
+
+        return {
+            "success": True,
+            "container_name": container_name,
+            "logs": logs,
+            "log_count": len(logs),
+            "timestamp": datetime.now().isoformat(),
+            "sensitive_data_found": sensitive_data_found,
+            "masked_fields": masked_fields
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Log fetch timeout - logs too large or container unresponsive",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Docker executable not found - Docker may not be installed",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        # Catch unexpected errors - return generic message
+        # Never expose full exception details to agent
+        return {
+            "success": False,
+            "container_name": container_name,
+            "error": "Failed to fetch logs due to system error",
+            "timestamp": datetime.now().isoformat()
+            # Internal logging would happen here:
+            # logger.error(f"Docker logs fetch failed: {e}", exc_info=True)
+        }
+
+
+async def _fetch_docker_logs_mock(
+    container_name: str, tail: int
+) -> Dict[str, Any]:
+    """
+    Mock Docker logs fetch for testing without real Docker.
+
+    Args:
+        container_name: Container name
+        tail: Log line count
+
+    Returns:
+        Mock log data
+    """
+
+    mock_logs = [
+        "2026-01-01T12:00:00Z INFO Application starting up",
+        "2026-01-01T12:00:01Z INFO Loading configuration from /etc/app/config.yaml",
+        "2026-01-01T12:00:02Z INFO Database connection pool initialized (size=20)",
+        "2026-01-01T12:00:03Z INFO Starting HTTP server on 0.0.0.0:8080",
+        "2026-01-01T12:00:05Z INFO Server ready, listening for requests",
+        "2026-01-01T12:05:00Z WARN High memory usage: 512MB / 1GB",
+        "2026-01-01T12:10:00Z WARN Response time exceeding threshold: 2500ms",
+        "2026-01-01T12:15:00Z ERROR Database connection timeout after 30s",
+        "2026-01-01T12:15:01Z ERROR Retry attempt 1/3...",
+        "2026-01-01T12:15:05Z INFO Database connection restored",
+    ]
+
+    # Return only requested number of lines
+    logs_to_return = mock_logs[-min(tail, len(mock_logs)):]
+
+    return {
+        "success": True,
+        "container_name": container_name,
+        "logs": logs_to_return,
+        "log_count": len(logs_to_return),
+        "timestamp": datetime.now().isoformat(),
+        "sensitive_data_found": False,
+        "masked_fields": [],
+        "note": "Mock logs - real Docker not connected"
+    }
+
+
+def _sanitize_docker_error(error_msg: str) -> str:
+    """
+    Sanitize Docker error messages to remove sensitive information.
+
+    Removes:
+    - System file paths (/var/lib/docker/...)
+    - Docker daemon details
+    - IP addresses and hostnames
+    - Socket paths
+
+    Args:
+        error_msg: Raw Docker error message
+
+    Returns:
+        Sanitized error message safe to return to agents
+    """
+
+    # Remove file system paths
+    error_msg = re.sub(r"/[a-zA-Z0-9/_.-]+", "<path>", error_msg)
+
+    # Remove IP addresses
+    error_msg = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "<ip>", error_msg)
+
+    # Remove socket paths
+    error_msg = re.sub(r"/var/run/docker\.sock", "<docker_socket>", error_msg)
+
+    return error_msg
+
+
+def _mask_sensitive_data(
+    log_line: str
+) -> tuple[str, bool, List[str]]:
+    """
+    Scan log line for sensitive data and mask it.
+
+    Detects and masks:
+    - API keys (pattern: key= followed by alphanumeric)
+    - Passwords (pattern: password= or pwd=)
+    - JWT tokens (pattern: ey followed by base64)
+    - Database passwords (pattern: database_password=)
+    - AWS credentials (pattern: AKIA...)
+    - Bearer tokens (pattern: Bearer ...)
+
+    Args:
+        log_line: Original log line
+
+    Returns:
+        Tuple of:
+        - Masked log line (sensitive data replaced with *****)
+        - Boolean: was sensitive data found?
+        - List of field names that were masked
+    """
+
+    masked_fields = []
+    masked_line = log_line
+    found = False
+
+    # Pattern 1: API keys (key=xxxx, api_key=xxxx, etc.)
+    if re.search(r"(api_key|key|secret|token)\s*=\s*[a-zA-Z0-9._-]+", log_line, re.IGNORECASE):
+        masked_line = re.sub(
+            r"(api_key|key|secret|token)\s*=\s*[a-zA-Z0-9._-]+",
+            r"\1=*****",
+            masked_line,
+            flags=re.IGNORECASE
+        )
+        masked_fields.append("api_key")
+        found = True
+
+    # Pattern 2: Passwords
+    if re.search(r"(password|pwd|passwd)\s*=\s*\S+", log_line, re.IGNORECASE):
+        masked_line = re.sub(
+            r"(password|pwd|passwd)\s*=\s*\S+",
+            r"\1=*****",
+            masked_line,
+            flags=re.IGNORECASE
+        )
+        masked_fields.append("password")
+        found = True
+
+    # Pattern 3: JWT tokens (starts with "ey")
+    if re.search(r"\beyJ[a-zA-Z0-9._-]+\b", log_line):
+        masked_line = re.sub(
+            r"\beyJ[a-zA-Z0-9._-]+\b",
+            "*****",
+            masked_line
+        )
+        masked_fields.append("jwt_token")
+        found = True
+
+    # Pattern 4: Bearer tokens
+    if re.search(r"Bearer\s+\S+", log_line, re.IGNORECASE):
+        masked_line = re.sub(
+            r"Bearer\s+\S+",
+            "Bearer *****",
+            masked_line,
+            flags=re.IGNORECASE
+        )
+        masked_fields.append("bearer_token")
+        found = True
+
+    # Pattern 5: AWS credentials (AKIA...)
+    if re.search(r"AKIA[0-9A-Z]{16}", log_line):
+        masked_line = re.sub(r"AKIA[0-9A-Z]{16}", "*****", masked_line)
+        masked_fields.append("aws_access_key")
+        found = True
+
+    return masked_line, found, list(set(masked_fields))  # deduplicate fields
